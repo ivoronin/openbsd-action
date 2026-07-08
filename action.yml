@@ -127,7 +127,7 @@ runs:
         set -euo pipefail
 
         tar -xOzf "$OBA_ARCHIVE" disk.raw \
-          | dd "of=$OBA_DISK" bs=64K iflag=fullblock conv=sparse status=progress
+          | dd "of=$OBA_DISK" bs=64K iflag=fullblock conv=sparse
 
     - name: Prepare guest access
       shell: bash
@@ -224,16 +224,18 @@ runs:
       run: |
         set -euo pipefail
 
+        last_error="$OBA_ROOT/ssh.last-error"
         for _ in $(seq 1 90); do
           if ! kill -0 "$(cat "$OBA_QEMU_PID")" 2>/dev/null; then
             echo "qemu exited before SSH became available" >&2
             exit 1
           fi
-          ssh -F "$OBA_SSH_CONFIG" openbsd-action true && exit 0
+          ssh -F "$OBA_SSH_CONFIG" openbsd-action true 2>"$last_error" && exit 0
           sleep 2
         done
 
         echo "timed out waiting for SSH" >&2
+        cat "$last_error" >&2 || true
         exit 1
 
     - name: Install rsync
