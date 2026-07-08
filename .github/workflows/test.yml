@@ -1,0 +1,75 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-24.04
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          install_dir="$RUNNER_TEMP/actionlint"
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          mkdir -p "$install_dir"
+
+          gh release download "v${ACTIONLINT_VERSION}" \
+            --repo rhysd/actionlint \
+            --pattern "$archive" \
+            --dir "$install_dir" \
+            --clobber
+
+          gh attestation verify "$install_dir/$archive" \
+            --repo rhysd/actionlint \
+            --deny-self-hosted-runners
+
+          tar -xzf "$install_dir/$archive" -C "$install_dir" actionlint
+          echo "$install_dir" >> "$GITHUB_PATH"
+      - name: Run actionlint
+        run: actionlint
+
+  openbsd:
+    name: ${{ matrix.arch }} (${{ matrix.accel }})
+    runs-on: ubuntu-24.04
+    needs: actionlint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            accel: kvm
+            image: openbsd-79-generic-full-amd64-bios-2bd66ca-202607080953.tar.gz
+          - arch: arm64
+            accel: tcg
+            image: openbsd-79-generic-full-arm64-uefi-2bd66ca-202607080953.tar.gz
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Run local action
+        uses: ./
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          release: "20260708"
+          image: ${{ matrix.image }}
+          arch: ${{ matrix.arch }}
+          run: |
+            uname -a
+            cc -v >/tmp/openbsd-action-cc-version.txt 2>&1
+            printf '%s\n' '${{ matrix.arch }} e2e ok' > openbsd-action-e2e-${{ matrix.arch }}.txt
+      - name: Check synced output
+        run: test -s "openbsd-action-e2e-${{ matrix.arch }}.txt"

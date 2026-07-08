@@ -1,0 +1,331 @@
+name: OpenBSD Action
+description: Run a command in an OpenBSD QEMU VM booted from an attested image
+
+inputs:
+  repo:
+    description: GitHub owner/name repository containing the OpenBSD image release
+    required: false
+    default: ivoronin/openbsd-cloudimg
+  release:
+    description: Release tag in the image repository
+    required: true
+  image:
+    description: Exact image release asset name
+    required: true
+  arch:
+    description: OpenBSD image architecture, amd64 or arm64
+    required: true
+  run:
+    description: Command to run inside /home/openbsd/work
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare host
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        sudo apt-get update
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          openssh-client \
+          rsync \
+          xorriso \
+          qemu-system-x86 \
+          qemu-system-arm \
+          qemu-efi-aarch64 \
+          tar \
+          gzip
+
+        if [ -e /dev/kvm ]; then
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+        fi
+
+    - name: Prepare runtime
+      shell: bash
+      env:
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_RELEASE: ${{ inputs.release }}
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_ARCH: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+
+        case "$INPUT_ARCH" in
+          amd64) firmware=bios ;;
+          arm64) firmware=uefi ;;
+          *) echo "arch must be amd64 or arm64" >&2; exit 2 ;;
+        esac
+
+        case "$(uname -m)" in
+          x86_64) host_arch=amd64 ;;
+          aarch64|arm64) host_arch=arm64 ;;
+          *) host_arch=unknown ;;
+        esac
+
+        accel=tcg
+        if [ "$INPUT_ARCH" = "$host_arch" ] && [ -e /dev/kvm ]; then
+          accel=kvm
+        fi
+
+        root="$RUNNER_TEMP/openbsd-action/$GITHUB_RUN_ID"
+        mkdir -p "$root/image" "$root/cidata"
+        chmod 700 "$root"
+
+        cat >> "$GITHUB_ENV" <<EOF
+        OBA_REPO=$INPUT_REPO
+        OBA_RELEASE=$INPUT_RELEASE
+        OBA_IMAGE=$INPUT_IMAGE
+        OBA_ARCH=$INPUT_ARCH
+        OBA_FIRMWARE=$firmware
+        OBA_ACCEL=$accel
+        OBA_PORT=$(shuf -i 20000-60000 -n 1)
+        OBA_ROOT=$root
+        OBA_ARCHIVE=$root/image.tar.gz
+        OBA_DISK=$root/image/disk.raw
+        OBA_CIDATA=$root/cidata
+        OBA_CIDATA_ISO=$root/cidata.iso
+        OBA_CONSOLE_LOG=$root/console.log
+        OBA_QEMU_LOG=$root/qemu.log
+        OBA_QEMU_PID=$root/qemu.pid
+        OBA_SSH_KEY=$root/id_ed25519
+        OBA_KNOWN_HOSTS=$root/known_hosts
+        OBA_SSH_CONFIG=$root/ssh_config
+        OBA_EFI_VARS=$root/efi-vars.fd
+        EOF
+
+    - name: Download image
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        gh release download "$OBA_RELEASE" \
+          --repo "$OBA_REPO" \
+          --pattern "$OBA_IMAGE" \
+          --dir "$OBA_ROOT" \
+          --clobber
+        mv "$OBA_ROOT/$OBA_IMAGE" "$OBA_ARCHIVE"
+
+    - name: Verify image attestation
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        gh attestation verify "$OBA_ARCHIVE" \
+          --repo "$OBA_REPO" \
+          --signer-workflow "github.com/$OBA_REPO/.github/workflows/build.yml" \
+          --source-ref "refs/tags/$OBA_RELEASE" \
+          --deny-self-hosted-runners
+
+    - name: Extract sparse disk
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        tar -xOzf "$OBA_ARCHIVE" disk.raw \
+          | dd "of=$OBA_DISK" bs=64K iflag=fullblock conv=sparse status=progress
+
+    - name: Prepare guest access
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ssh-keygen -q -t ed25519 -f "$OBA_SSH_KEY" -N "" -C openbsd-action
+        chmod 600 "$OBA_SSH_KEY"
+        touch "$OBA_KNOWN_HOSTS"
+
+        cat > "$OBA_SSH_CONFIG" <<EOF
+        Host openbsd-action
+          HostName 127.0.0.1
+          Port $OBA_PORT
+          User openbsd
+          IdentityFile $OBA_SSH_KEY
+          IdentitiesOnly yes
+          BatchMode yes
+          StrictHostKeyChecking accept-new
+          UserKnownHostsFile $OBA_KNOWN_HOSTS
+          CheckHostIP no
+          LogLevel ERROR
+        EOF
+        chmod 600 "$OBA_SSH_CONFIG" "$OBA_KNOWN_HOSTS"
+
+        cat > "$OBA_CIDATA/meta-data" <<EOF
+        instance-id: openbsd-action-$GITHUB_RUN_ID
+        local-hostname: openbsd-action
+        public-keys:
+          - $(cat "$OBA_SSH_KEY.pub")
+        EOF
+
+        (
+          cd "$OBA_CIDATA"
+          xorriso -as mkisofs -V CIDATA -J -r -o "$OBA_CIDATA_ISO" meta-data
+        )
+
+    - name: Boot OpenBSD
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        case "$OBA_ARCH" in
+          amd64)
+            qemu=qemu-system-x86_64
+            machine=pc
+            cpu=()
+            ;;
+          arm64)
+            qemu=qemu-system-aarch64
+            machine=virt
+            if [ "$OBA_ACCEL" = kvm ]; then
+              cpu=(-cpu host)
+            else
+              cpu=(-cpu cortex-a72)
+            fi
+            ;;
+        esac
+
+        args=(
+          "$qemu"
+          -machine "$machine"
+          -accel "$OBA_ACCEL"
+          -m 2G
+          -smp 2
+          -display none
+          -serial "file:$OBA_CONSOLE_LOG"
+          -drive "file=$OBA_DISK,format=raw,if=none,id=drive0"
+          -device virtio-blk-pci,drive=drive0
+          -drive "file=$OBA_CIDATA_ISO,format=raw,readonly=on,if=none,id=cidata"
+          -device virtio-blk-pci,drive=cidata
+          -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$OBA_PORT-:22"
+          -device virtio-net-pci,netdev=n0
+          "${cpu[@]}"
+        )
+
+        if [ "$OBA_FIRMWARE" = uefi ]; then
+          efi_code=/usr/share/qemu/edk2-aarch64-code.fd
+          efi_vars=/usr/share/qemu/edk2-arm-vars.fd
+          [ -e "$efi_code" ] || efi_code=/usr/share/AAVMF/AAVMF_CODE.fd
+          [ -e "$efi_vars" ] || efi_vars=/usr/share/AAVMF/AAVMF_VARS.fd
+          cp "$efi_vars" "$OBA_EFI_VARS"
+          args+=(
+            -drive "if=pflash,format=raw,readonly=on,file=$efi_code"
+            -drive "if=pflash,format=raw,file=$OBA_EFI_VARS"
+          )
+        fi
+
+        "${args[@]}" >"$OBA_QEMU_LOG" 2>&1 < /dev/null &
+        echo "$!" > "$OBA_QEMU_PID"
+
+    - name: Wait for SSH
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        for _ in $(seq 1 90); do
+          if ! kill -0 "$(cat "$OBA_QEMU_PID")" 2>/dev/null; then
+            echo "qemu exited before SSH became available" >&2
+            exit 1
+          fi
+          ssh -F "$OBA_SSH_CONFIG" openbsd-action true && exit 0
+          sleep 2
+        done
+
+        echo "timed out waiting for SSH" >&2
+        exit 1
+
+    - name: Install rsync
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ssh -F "$OBA_SSH_CONFIG" openbsd-action \
+          'doas pkg_add -I rsync-- && /usr/local/bin/rsync --version >/dev/null && mkdir -p /home/openbsd/work'
+
+    - name: Sync workspace in
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        rsync -a \
+          --rsync-path=/usr/local/bin/rsync \
+          -e "ssh -F $OBA_SSH_CONFIG" \
+          "$GITHUB_WORKSPACE/" \
+          openbsd-action:/home/openbsd/work/
+
+    - name: Run command
+      shell: bash
+      env:
+        OBA_RUN: ${{ inputs.run }}
+      run: |
+        set -euo pipefail
+        set +e
+
+        printf '%s\n' "$OBA_RUN" \
+          | ssh -F "$OBA_SSH_CONFIG" openbsd-action 'cd /home/openbsd/work && exec sh -s'
+        status=$?
+
+        echo "OBA_STATUS=$status" >> "$GITHUB_ENV"
+        exit 0
+
+    - name: Sync workspace out
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ ! -s "$OBA_QEMU_PID" ] || ! kill -0 "$(cat "$OBA_QEMU_PID")" 2>/dev/null; then
+          exit 0
+        fi
+
+        rsync -a \
+          --rsync-path=/usr/local/bin/rsync \
+          -e "ssh -F $OBA_SSH_CONFIG" \
+          openbsd-action:/home/openbsd/work/ \
+          "$GITHUB_WORKSPACE/" \
+          || [ -z "${OBA_STATUS:-}" ]
+
+    - name: Print OpenBSD logs
+      if: ${{ failure() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        [ ! -f "$OBA_CONSOLE_LOG" ] || cat "$OBA_CONSOLE_LOG" >&2
+        [ ! -s "$OBA_QEMU_LOG" ] || cat "$OBA_QEMU_LOG" >&2
+
+    - name: Stop OpenBSD
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        [ -s "$OBA_QEMU_PID" ] || exit 0
+        pid="$(cat "$OBA_QEMU_PID")"
+        kill "$pid" 2>/dev/null || exit 0
+        sleep 5
+        kill -9 "$pid" 2>/dev/null || true
+
+    - name: Clean runtime
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ "${OPENBSD_ACTION_KEEP_TEMP:-}" = 1 ]; then
+          echo "keeping runtime at $OBA_ROOT"
+        else
+          rm -rf "$OBA_ROOT"
+        fi
+
+    - name: Exit with guest status
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -n "${OBA_STATUS:-}" ]; then
+          exit "$OBA_STATUS"
+        fi
