@@ -43,10 +43,24 @@ jobs:
       - name: Run actionlint
         run: actionlint
 
+  shellcheck:
+    runs-on: ubuntu-24.04
+    needs: actionlint
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install ShellCheck
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Run ShellCheck
+        run: shellcheck scripts/*.sh
+
   openbsd:
     name: ${{ matrix.arch }} (${{ matrix.accel }})
     runs-on: ubuntu-24.04
-    needs: actionlint
+    needs: shellcheck
     strategy:
       fail-fast: false
       matrix:

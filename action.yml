@@ -69,87 +69,26 @@ runs:
         INPUT_IMAGE: ${{ inputs.image }}
         INPUT_ARCH: ${{ inputs.arch }}
         INPUT_PORTS: ${{ inputs.ports }}
-      run: |
-        set -euo pipefail
-
-        case "$INPUT_ARCH" in
-          amd64) firmware=bios ;;
-          arm64) firmware=uefi ;;
-          *) echo "arch must be amd64 or arm64" >&2; exit 2 ;;
-        esac
-
-        case "$(uname -m)" in
-          x86_64) host_arch=amd64 ;;
-          aarch64|arm64) host_arch=arm64 ;;
-          *) host_arch=unknown ;;
-        esac
-
-        case "$INPUT_PORTS" in
-          true|false) ;;
-          *) echo "ports must be true or false" >&2; exit 2 ;;
-        esac
-
-        accel=tcg
-        if [ "$INPUT_ARCH" = "$host_arch" ] && [ -e /dev/kvm ]; then
-          accel=kvm
-        fi
-
-        root="$RUNNER_TEMP/openbsd-action/$GITHUB_RUN_ID"
-        mkdir -p "$root/image" "$root/cidata"
-        chmod 700 "$root"
-
-        cat >> "$GITHUB_ENV" <<EOF
-        OBA_REPO=$INPUT_REPO
-        OBA_RELEASE=$INPUT_RELEASE
-        OBA_IMAGE=$INPUT_IMAGE
-        OBA_ARCH=$INPUT_ARCH
-        OBA_FIRMWARE=$firmware
-        OBA_ACCEL=$accel
-        OBA_PORT=$(shuf -i 20000-60000 -n 1)
-        OBA_ROOT=$root
-        OBA_ARCHIVE=$root/image.tar.gz
-        OBA_DISK=$root/image/disk.raw
-        OBA_CIDATA=$root/cidata
-        OBA_CIDATA_ISO=$root/cidata.iso
-        OBA_CONSOLE_LOG=$root/console.log
-        OBA_QEMU_LOG=$root/qemu.log
-        OBA_QEMU_PID=$root/qemu.pid
-        OBA_SSH_KEY=$root/id_ed25519
-        OBA_KNOWN_HOSTS=$root/known_hosts
-        OBA_SSH_CONFIG=$root/ssh_config
-        OBA_EFI_VARS=$root/efi-vars.fd
-        EOF
+      run: bash "${{ github.action_path }}/scripts/prepare-runtime.sh"
 
     - name: Download image
       shell: bash
       run: |
-        set -euo pipefail
-
-        gh release download "$OBA_RELEASE" \
-          --repo "$OBA_REPO" \
-          --pattern "$OBA_IMAGE" \
-          --dir "$OBA_ROOT" \
-          --clobber
+        gh release download "$OBA_RELEASE" --repo "$OBA_REPO" --pattern "$OBA_IMAGE" --dir "$OBA_ROOT" --clobber
         mv "$OBA_ROOT/$OBA_IMAGE" "$OBA_ARCHIVE"
 
     - name: Verify image attestation
       shell: bash
-      run: |
-        set -euo pipefail
-
-        gh attestation verify "$OBA_ARCHIVE" \
-          --repo "$OBA_REPO" \
-          --signer-workflow "github.com/$OBA_REPO/.github/workflows/build.yml" \
-          --source-ref "refs/tags/$OBA_RELEASE" \
-          --deny-self-hosted-runners
+      run: >-
+        gh attestation verify "$OBA_ARCHIVE"
+        --repo "$OBA_REPO"
+        --signer-workflow "github.com/$OBA_REPO/.github/workflows/build.yml"
+        --source-ref "refs/tags/$OBA_RELEASE"
+        --deny-self-hosted-runners
 
     - name: Extract sparse disk
       shell: bash
-      run: |
-        set -euo pipefail
-
-        tar -xOzf "$OBA_ARCHIVE" disk.raw \
-          | dd "of=$OBA_DISK" bs=64K iflag=fullblock conv=sparse
+      run: tar -xOzf "$OBA_ARCHIVE" disk.raw | dd "of=$OBA_DISK" bs=64K iflag=fullblock conv=sparse
 
     - name: Prepare guest access
       shell: bash
@@ -189,57 +128,7 @@ runs:
 
     - name: Boot OpenBSD
       shell: bash
-      run: |
-        set -euo pipefail
-
-        case "$OBA_ARCH" in
-          amd64)
-            qemu=qemu-system-x86_64
-            machine=pc
-            cpu=()
-            ;;
-          arm64)
-            qemu=qemu-system-aarch64
-            machine=virt
-            if [ "$OBA_ACCEL" = kvm ]; then
-              cpu=(-cpu host)
-            else
-              cpu=(-cpu cortex-a72)
-            fi
-            ;;
-        esac
-
-        args=(
-          "$qemu"
-          -machine "$machine"
-          -accel "$OBA_ACCEL"
-          -m 2G
-          -smp 2
-          -display none
-          -serial "file:$OBA_CONSOLE_LOG"
-          -drive "file=$OBA_DISK,format=raw,if=none,id=drive0"
-          -device virtio-blk-pci,drive=drive0
-          -drive "file=$OBA_CIDATA_ISO,format=raw,readonly=on,if=none,id=cidata"
-          -device virtio-blk-pci,drive=cidata
-          -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$OBA_PORT-:22"
-          -device virtio-net-pci,netdev=n0
-          "${cpu[@]}"
-        )
-
-        if [ "$OBA_FIRMWARE" = uefi ]; then
-          efi_code=/usr/share/qemu/edk2-aarch64-code.fd
-          efi_vars=/usr/share/qemu/edk2-arm-vars.fd
-          [ -e "$efi_code" ] || efi_code=/usr/share/AAVMF/AAVMF_CODE.fd
-          [ -e "$efi_vars" ] || efi_vars=/usr/share/AAVMF/AAVMF_VARS.fd
-          cp "$efi_vars" "$OBA_EFI_VARS"
-          args+=(
-            -drive "if=pflash,format=raw,readonly=on,file=$efi_code"
-            -drive "if=pflash,format=raw,file=$OBA_EFI_VARS"
-          )
-        fi
-
-        "${args[@]}" >"$OBA_QEMU_LOG" 2>&1 < /dev/null &
-        echo "$!" > "$OBA_QEMU_PID"
+      run: bash "${{ github.action_path }}/scripts/boot-openbsd.sh"
 
     - name: Wait for SSH
       shell: bash
@@ -262,11 +151,23 @@ runs:
 
     - name: Install rsync
       shell: bash
+      run: >-
+        ssh -F "$OBA_SSH_CONFIG" openbsd-action
+        'doas pkg_add -I rsync-- && /usr/local/bin/rsync --version >/dev/null && mkdir -p /home/openbsd/work'
+
+    - name: Sync action scripts
+      shell: bash
       run: |
         set -euo pipefail
 
+        rsync -a \
+          --rsync-path=/usr/local/bin/rsync \
+          -e "ssh -F $OBA_SSH_CONFIG" \
+          "${{ github.action_path }}/scripts/" \
+          openbsd-action:/tmp/openbsd-action-scripts/
+
         ssh -F "$OBA_SSH_CONFIG" openbsd-action \
-          'doas pkg_add -I rsync-- && /usr/local/bin/rsync --version >/dev/null && mkdir -p /home/openbsd/work'
+          'chmod -R u+rwX,go+rX /tmp/openbsd-action-scripts && find /tmp/openbsd-action-scripts -type f -name "*.sh" -exec chmod 755 {} \;'
 
     - name: Prepare ports tree
       if: ${{ inputs.ports == 'true' }}
@@ -278,31 +179,19 @@ runs:
       run: |
         set -euo pipefail
 
-        rsync -a \
-          --rsync-path=/usr/local/bin/rsync \
-          -e "ssh -F $OBA_SSH_CONFIG" \
-          "${{ github.action_path }}/scripts/prepare-ports.sh" \
-          openbsd-action:/tmp/openbsd-action-prepare-ports.sh
-        ssh -F "$OBA_SSH_CONFIG" openbsd-action \
-          'chmod 700 /tmp/openbsd-action-prepare-ports.sh'
-
         {
           printf '%s\n' "$OBA_PORTS_ARCHIVE_URL_PREFIX_INPUT"
           printf '%s\n' "$OBA_PORTS_CVS_ROOT_INPUT"
           printf '%s\n' "$OBA_PORTS_CVS_REF_INPUT"
         } | ssh -F "$OBA_SSH_CONFIG" openbsd-action \
-          '/tmp/openbsd-action-prepare-ports.sh'
+          '/tmp/openbsd-action-scripts/prepare-ports.sh'
 
     - name: Sync workspace in
       shell: bash
-      run: |
-        set -euo pipefail
-
-        rsync -a \
-          --rsync-path=/usr/local/bin/rsync \
-          -e "ssh -F $OBA_SSH_CONFIG" \
-          "$GITHUB_WORKSPACE/" \
-          openbsd-action:/home/openbsd/work/
+      run: >-
+        rsync -a --rsync-path=/usr/local/bin/rsync -e "ssh -F $OBA_SSH_CONFIG"
+        "$GITHUB_WORKSPACE/"
+        openbsd-action:/home/openbsd/work/
 
     - name: Run command
       shell: bash
@@ -340,8 +229,6 @@ runs:
       if: ${{ failure() }}
       shell: bash
       run: |
-        set -euo pipefail
-
         [ ! -f "$OBA_CONSOLE_LOG" ] || cat "$OBA_CONSOLE_LOG" >&2
         [ ! -s "$OBA_QEMU_LOG" ] || cat "$OBA_QEMU_LOG" >&2
 
@@ -372,9 +259,4 @@ runs:
     - name: Exit with guest status
       if: ${{ always() }}
       shell: bash
-      run: |
-        set -euo pipefail
-
-        if [ -n "${OBA_STATUS:-}" ]; then
-          exit "$OBA_STATUS"
-        fi
+      run: '[ -z "${OBA_STATUS:-}" ] || exit "$OBA_STATUS"'
