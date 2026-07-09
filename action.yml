@@ -15,6 +15,22 @@ inputs:
   arch:
     description: OpenBSD image architecture, amd64 or arm64
     required: true
+  ports:
+    description: Prepare /usr/ports before running the command
+    required: false
+    default: "false"
+  ports-archive-url-prefix:
+    description: URL prefix containing ports.tar.gz and SHA256.sig
+    required: false
+    default: ""
+  ports-cvs-root:
+    description: AnonCVS root used to update /usr/ports, for example anoncvs@host:/cvs
+    required: false
+    default: ""
+  ports-cvs-ref:
+    description: CVS ref for /usr/ports; required with ports-cvs-root, current uses CVS -A
+    required: false
+    default: ""
   run:
     description: Command to run inside /home/openbsd/work
     required: true
@@ -52,6 +68,7 @@ runs:
         INPUT_RELEASE: ${{ inputs.release }}
         INPUT_IMAGE: ${{ inputs.image }}
         INPUT_ARCH: ${{ inputs.arch }}
+        INPUT_PORTS: ${{ inputs.ports }}
       run: |
         set -euo pipefail
 
@@ -65,6 +82,11 @@ runs:
           x86_64) host_arch=amd64 ;;
           aarch64|arm64) host_arch=arm64 ;;
           *) host_arch=unknown ;;
+        esac
+
+        case "$INPUT_PORTS" in
+          true|false) ;;
+          *) echo "ports must be true or false" >&2; exit 2 ;;
         esac
 
         accel=tcg
@@ -245,6 +267,31 @@ runs:
 
         ssh -F "$OBA_SSH_CONFIG" openbsd-action \
           'doas pkg_add -I rsync-- && /usr/local/bin/rsync --version >/dev/null && mkdir -p /home/openbsd/work'
+
+    - name: Prepare ports tree
+      if: ${{ inputs.ports == 'true' }}
+      shell: bash
+      env:
+        OBA_PORTS_ARCHIVE_URL_PREFIX_INPUT: ${{ inputs.ports-archive-url-prefix }}
+        OBA_PORTS_CVS_ROOT_INPUT: ${{ inputs.ports-cvs-root }}
+        OBA_PORTS_CVS_REF_INPUT: ${{ inputs.ports-cvs-ref }}
+      run: |
+        set -euo pipefail
+
+        rsync -a \
+          --rsync-path=/usr/local/bin/rsync \
+          -e "ssh -F $OBA_SSH_CONFIG" \
+          "${{ github.action_path }}/scripts/prepare-ports.sh" \
+          openbsd-action:/tmp/openbsd-action-prepare-ports.sh
+        ssh -F "$OBA_SSH_CONFIG" openbsd-action \
+          'chmod 700 /tmp/openbsd-action-prepare-ports.sh'
+
+        {
+          printf '%s\n' "$OBA_PORTS_ARCHIVE_URL_PREFIX_INPUT"
+          printf '%s\n' "$OBA_PORTS_CVS_ROOT_INPUT"
+          printf '%s\n' "$OBA_PORTS_CVS_REF_INPUT"
+        } | ssh -F "$OBA_SSH_CONFIG" openbsd-action \
+          '/tmp/openbsd-action-prepare-ports.sh'
 
     - name: Sync workspace in
       shell: bash

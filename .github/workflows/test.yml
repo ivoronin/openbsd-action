@@ -54,9 +54,13 @@ jobs:
           - arch: amd64
             accel: kvm
             image: openbsd-79-generic-full-amd64-bios-2bd66ca-202607080953.tar.gz
+            ports: true
+            ports_archive_url_prefix: https://cdn.openbsd.org/pub/OpenBSD/7.9
           - arch: arm64
             accel: tcg
             image: openbsd-79-generic-full-arm64-uefi-2bd66ca-202607080953.tar.gz
+            ports: false
+            ports_archive_url_prefix: ""
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Run local action
@@ -67,9 +71,21 @@ jobs:
           release: "20260708"
           image: ${{ matrix.image }}
           arch: ${{ matrix.arch }}
+          ports: ${{ matrix.ports }}
+          ports-archive-url-prefix: ${{ matrix.ports_archive_url_prefix }}
           run: |
             uname -a
-            cc -v >/tmp/openbsd-action-cc-version.txt 2>&1
+            if [ '${{ matrix.ports }}' = true ]; then
+              test -f /usr/ports/infrastructure/mk/bsd.port.mk
+              pkgname=$(
+                cd /usr/ports/devel/gmake
+                make show=PKGNAME
+              )
+              case "$pkgname" in
+                gmake-*) ;;
+                *) echo "unexpected PKGNAME: $pkgname" >&2; exit 1 ;;
+              esac
+            fi
             printf '%s\n' '${{ matrix.arch }} e2e ok' > openbsd-action-e2e-${{ matrix.arch }}.txt
       - name: Check synced output
         run: test -s "openbsd-action-e2e-${{ matrix.arch }}.txt"
