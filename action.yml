@@ -79,6 +79,8 @@ runs:
 
     - name: Verify image attestation
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: >-
         gh attestation verify "$OBA_ARCHIVE"
         --repo "$OBA_REPO"
